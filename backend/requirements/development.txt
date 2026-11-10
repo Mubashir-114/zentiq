@@ -1,0 +1,6 @@
+-r base.txt
+
+# Testing & QA
+pytest>=8.0.0
+pytest-django>=4.9.0
+

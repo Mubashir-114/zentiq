@@ -1,0 +1,11 @@
+{
+  "include": [
+    "."
+  ],
+  "extraPaths": [
+    "."
+  ],
+  "typeCheckingMode": "off",
+  "reportAttributeAccessIssue": "none"
+}
+

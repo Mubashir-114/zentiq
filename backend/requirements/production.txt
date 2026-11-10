@@ -1,0 +1,5 @@
+-r base.txt
+
+# Production WSGI/ASGI & Static Files
+whitenoise>=6.8.0
+

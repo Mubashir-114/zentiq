@@ -1,0 +1,15 @@
+# Core Framework
+Django>=6.0.0,<6.1.0
+djangorestframework>=3.15.0
+django-cors-headers>=4.7.0
+drf-spectacular>=0.28.0
+
+# Database & Drivers (MySQL 8.4 default)
+PyMySQL>=1.1.0
+cryptography>=44.0.0
+
+# Environment & Utilities
+python-dotenv>=1.0.0
+asgiref>=3.8.0
+sqlparse>=0.5.0
+

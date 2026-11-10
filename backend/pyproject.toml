@@ -1,0 +1,14 @@
+[tool.pyrefly]
+search-path = ["."]
+
+[tool.pyrefly.errors]
+missing-attribute = "ignore"
+bad-assignment = "ignore"
+untyped-import = "ignore"
+bad-override-mutable-attribute = "ignore"
+bad-override = "ignore"
+
+[tool.pyright]
+extraPaths = ["."]
+typeCheckingMode = "off"
+reportAttributeAccessIssue = "none"
