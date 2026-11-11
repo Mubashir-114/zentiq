@@ -18,6 +18,7 @@ from apps.assessments.models import (
 )
 from .concurrency import with_deadlock_retry
 from .dto import CandidateQuestionDTO, sanitize_candidate_content_payload
+from .evaluation.canonical import contains_redaction_marker
 from .exceptions import (
     AnswerValidationError,
     AttemptExpiredError,
@@ -36,6 +37,10 @@ def validate_answer_payload_for_type(
 ) -> None:
     """
     Validates candidate answer payload against the snapshotted question type and presentation choices.
+
+    The internal redaction sentinel is rejected: ``redacted_at`` is the only
+    authoritative redaction indicator and can only be set server-side.
+
     Supported types:
     - SINGLE_CHOICE: {'selected_option_id': str/int}
     - MULTIPLE_CHOICE: {'selected_option_ids': list[str/int]} (non-empty)
@@ -46,6 +51,11 @@ def validate_answer_payload_for_type(
     """
     if not isinstance(answer_payload, dict):
         raise AnswerValidationError("Answer payload must be a JSON object (dictionary).")
+
+    if contains_redaction_marker(answer_payload):
+        raise AnswerValidationError(
+            "Reserved redaction marker is not permitted in a candidate answer payload."
+        )
 
     options = content_payload.get('options')
     valid_option_ids: set[str] = set()

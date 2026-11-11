@@ -16,6 +16,22 @@ from .composition_service import (
     lock_assessment_and_version,
     normalize_question_weight,
 )
+from .evaluation import (
+    ALLOWED_STRATEGIES,
+    EVALUATOR_VERSION,
+    POLICY_VERSION,
+    EvaluationConfigValidator,
+    QuestionEvaluationInput,
+    QuestionOutcome,
+    UngradableConfigurationError,
+    answer_payload_hash,
+    canonical_dumps,
+    derive_totals,
+    evaluate_question,
+)
+from .evaluation.service import AttemptEvaluationService
+from .result_revision_service import ResultRevisionService
+from .terminal_snapshot_service import TerminalSnapshotService
 from .concurrency import (
     DEFAULT_INITIAL_DELAY_SECONDS,
     DEFAULT_MAX_DEADLOCK_RETRIES,
@@ -31,6 +47,11 @@ from .dto import (
 from .exceptions import (
     ActiveAttemptExistsError,
     AnswerValidationError,
+    AttemptRedactedError,
+    EvaluationConfigurationError,
+    ResultRevisionConflictError,
+    ResultRevisionIntegrityError,
+    TerminalSnapshotConflictError,
     AssessmentDeprecatedError,
     AssessmentNoActiveVersionError,
     AssessmentNotFoundError,

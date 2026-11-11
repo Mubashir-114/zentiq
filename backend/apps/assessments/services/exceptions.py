@@ -159,3 +159,37 @@ class AssessmentValidationError(AssessmentServiceError):
     code = 'validation_error'
     default_message = "The assessment operation failed validation."
 
+
+# ---------------------------------------------------------------------------
+# Phase 2E.2 — Scoring & Evaluation foundation
+# ---------------------------------------------------------------------------
+
+class ResultRevisionConflictError(AssessmentServiceError):
+    """Raised when a result revision request is stale or competes with another writer."""
+    code = 'result_revision_conflict'
+    default_message = "The result revision request conflicts with the current authoritative result."
+
+
+class ResultRevisionIntegrityError(AssessmentServiceError):
+    """Raised when a revision/head relationship would violate attempt ownership."""
+    code = 'result_revision_integrity_error'
+    default_message = "The result revision violates attempt integrity constraints."
+
+
+class AttemptRedactedError(AssessmentServiceError):
+    """Raised when an attempt with redacted answer content is submitted for evaluation."""
+    code = 'attempt_redacted'
+    default_message = "This attempt contains redacted answer content and cannot be evaluated or regraded."
+
+
+class TerminalSnapshotConflictError(AssessmentServiceError):
+    """Raised when a terminal snapshot already exists with a different terminal status."""
+    code = 'terminal_snapshot_conflict'
+    default_message = "A conflicting terminal policy snapshot already exists for this attempt."
+
+
+class EvaluationConfigurationError(AssessmentServiceError):
+    """Raised by strict evaluation-configuration validation (publication gate)."""
+    code = 'evaluation_configuration_error'
+    default_message = "The question evaluation configuration is incomplete or invalid."
+

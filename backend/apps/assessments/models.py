@@ -890,6 +890,15 @@ class AttemptAnswer(models.Model):
         blank=True,
         help_text=_('Server timestamp when the answer was recorded.'),
     )
+    redacted_at = models.DateTimeField(
+        _('redacted at'),
+        null=True,
+        blank=True,
+        help_text=_(
+            'Authoritative indicator that candidate answer content has been redacted. '
+            'Redacted answers cannot be evaluated or regraded.'
+        ),
+    )
     created_at = models.DateTimeField(_('created at'), auto_now_add=True)
     updated_at = models.DateTimeField(_('updated at'), auto_now=True)
 
@@ -991,3 +1000,565 @@ class AttemptEvent(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError(_("AttemptEvent records are append-only audit entries and cannot be deleted."))
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E.2 — Scoring & Evaluation foundation (Rev. 3.7 frozen architecture)
+# ---------------------------------------------------------------------------
+
+RESULT_STATUS_CHOICES = (
+    ('PROVISIONAL', 'Provisional'),
+    ('FINAL', 'Final'),
+)
+
+EVALUATION_STATUS_CHOICES = (
+    ('COMPLETE', 'Complete'),
+    ('AWAITING_MANUAL_GRADING', 'Awaiting manual grading'),
+    ('INCOMPLETE_COVERAGE', 'Incomplete coverage'),
+    ('CONFIGURATION_UNGRADABLE', 'Configuration ungradable'),
+)
+
+OUTCOME_CHOICES = (
+    ('CORRECT', 'Correct'),
+    ('PARTIALLY_CORRECT', 'Partially correct'),
+    ('INCORRECT', 'Incorrect'),
+    ('UNANSWERED', 'Unanswered'),
+    ('UNGRADED', 'Ungraded'),
+    ('PENDING_MANUAL', 'Pending manual evaluation'),
+)
+
+DISPOSITION_CHOICES = (
+    ('SCORED', 'Scored'),
+    ('EXCLUDED', 'Excluded'),
+    ('UNDECIDED', 'Undecided'),
+)
+
+ANSWER_PRESENCE_CHOICES = (
+    ('PRESENT', 'Present'),
+    ('ABSENT', 'Absent'),
+)
+
+ABSENCE_REASON_CHOICES = (
+    ('SKIPPED', 'Skipped'),
+    ('NOT_REACHED', 'Not reached'),
+    ('EMPTY_SUBMISSION', 'Empty submission'),
+)
+
+TERMINAL_STATUS_CHOICES = (
+    ('SUBMITTED', 'Submitted'),
+    ('EXPIRED', 'Expired'),
+    ('CANCELLED', 'Cancelled'),
+)
+
+OUTBOX_STATE_CHOICES = (
+    ('PENDING', 'Pending'),
+    ('CLAIMED', 'Claimed'),
+    ('PROCESSED', 'Processed'),
+    ('DEAD', 'Dead'),
+)
+
+RESULT_TERMINAL_STATUSES = ('SUBMITTED', 'EXPIRED', 'CANCELLED')
+
+
+def _reject_persisted_mutation(instance, label):
+    """Rejects updates to write-once rows (insert-only immutability guard)."""
+    if instance.pk and type(instance).objects.filter(pk=instance.pk).exists():
+        raise ValidationError(_(f"{label} records are immutable and cannot be modified."))
+
+
+class ImmutableResultQuerySet(models.QuerySet):
+    """QuerySet that blocks bulk mutation of write-once result records."""
+
+    def update(self, **kwargs):
+        raise ValidationError(_("Result records are immutable and cannot be updated in bulk."))
+
+    def delete(self):
+        raise ValidationError(_("Result records are immutable and cannot be deleted in bulk."))
+
+
+class AttemptTerminalSnapshot(models.Model):
+    """
+    Immutable terminal-transition policy snapshot (Phase 2E.2).
+    Freezes the three independent eligibility flags and the policy version in force
+    at the moment an attempt reached a terminal status, so later policy changes can
+    never retroactively evaluate, reward, or credit a past attempt.
+    Created only by the terminal transition services, inside their transaction.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt = models.OneToOneField(
+        AssessmentAttempt,
+        on_delete=models.PROTECT,
+        related_name='terminal_snapshot',
+        verbose_name=_('attempt'),
+    )
+    terminal_status = models.CharField(
+        _('terminal status'),
+        max_length=20,
+        choices=TERMINAL_STATUS_CHOICES,
+    )
+    evaluate_eligible = models.BooleanField(_('evaluate eligible'), default=False)
+    mastery_eligible = models.BooleanField(_('mastery eligible'), default=False)
+    xp_eligible = models.BooleanField(_('xp eligible'), default=False)
+    policy_version = models.CharField(_('policy version'), max_length=30)
+    decision_source = models.CharField(_('decision source'), max_length=20)
+    decided_at = models.DateTimeField(_('decided at'), default=timezone.now)
+
+    objects = ImmutableResultQuerySet.as_manager()
+
+    class Meta:
+        db_table = 'assessments_attempt_terminal_snapshot'
+        verbose_name = _('attempt terminal snapshot')
+        verbose_name_plural = _('attempt terminal snapshots')
+        constraints = [
+            models.CheckConstraint(
+                condition=~Q(terminal_status='IN_PROGRESS'),
+                name='chk_assessments_terminal_snapshot_not_in_progress',
+            ),
+            models.CheckConstraint(
+                condition=Q(terminal_status__in=[c[0] for c in TERMINAL_STATUS_CHOICES]),
+                name='chk_assessments_terminal_snapshot_status_valid',
+            ),
+        ]
+
+    def __str__(self):
+        return f"TerminalSnapshot[{self.attempt_id}] = {self.terminal_status}"
+
+    def save(self, *args, **kwargs):
+        _reject_persisted_mutation(self, 'AttemptTerminalSnapshot')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("AttemptTerminalSnapshot records are immutable and cannot be deleted."))
+
+
+class AttemptResultRevision(models.Model):
+    """
+    Immutable, complete snapshot of a single evaluation pass over an attempt.
+    Revisions are never updated or deleted; supersession is expressed by a new
+    revision whose ``supersedes`` pointer references the previous one, while
+    AttemptResultHead names the single authoritative current revision.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt = models.ForeignKey(
+        AssessmentAttempt,
+        on_delete=models.PROTECT,
+        related_name='result_revisions',
+        verbose_name=_('attempt'),
+    )
+    revision_number = models.PositiveIntegerField(
+        _('revision number'),
+        validators=[MinValueValidator(1)],
+    )
+    supersedes = models.ForeignKey(
+        'self',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='superseded_by',
+        verbose_name=_('supersedes'),
+    )
+    terminal_snapshot = models.ForeignKey(
+        AttemptTerminalSnapshot,
+        on_delete=models.PROTECT,
+        related_name='result_revisions',
+        verbose_name=_('terminal snapshot'),
+    )
+    status = models.CharField(_('result status'), max_length=20, choices=RESULT_STATUS_CHOICES)
+    evaluation_status = models.CharField(
+        _('evaluation status'),
+        max_length=30,
+        choices=EVALUATION_STATUS_CHOICES,
+    )
+    final_score = models.DecimalField(
+        _('final score'),
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    provisional_score = models.DecimalField(
+        _('provisional score'),
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total_weight = models.DecimalField(_('total weight'), max_digits=12, decimal_places=6)
+    graded_weight = models.DecimalField(_('graded weight'), max_digits=12, decimal_places=6)
+    excluded_weight = models.DecimalField(_('excluded weight'), max_digits=12, decimal_places=6)
+    earned_weight = models.DecimalField(_('earned weight'), max_digits=12, decimal_places=6)
+    question_count = models.PositiveIntegerField(_('question count'))
+    answered_count = models.PositiveIntegerField(_('answered count'))
+    correct_count = models.PositiveIntegerField(_('correct count'), default=0)
+    incorrect_count = models.PositiveIntegerField(_('incorrect count'), default=0)
+    partially_correct_count = models.PositiveIntegerField(_('partially correct count'), default=0)
+    unanswered_count = models.PositiveIntegerField(_('unanswered count'), default=0)
+    ungraded_count = models.PositiveIntegerField(_('ungraded count'), default=0)
+    pending_manual_count = models.PositiveIntegerField(_('pending manual count'), default=0)
+    scoring_policy_version = models.CharField(_('scoring policy version'), max_length=30)
+    evaluator_version = models.CharField(_('evaluator version'), max_length=20)
+    actor_type = models.CharField(_('actor type'), max_length=20, default='SYSTEM')
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='+',
+        verbose_name=_('actor'),
+    )
+    reason = models.CharField(_('reason'), max_length=30, default='INITIAL_EVALUATION')
+    reason_detail = models.CharField(_('reason detail'), max_length=255, blank=True, default='')
+    created_at = models.DateTimeField(_('created at'), default=timezone.now)
+
+    objects = ImmutableResultQuerySet.as_manager()
+
+    class Meta:
+        db_table = 'assessments_attempt_result_revision'
+        verbose_name = _('attempt result revision')
+        verbose_name_plural = _('attempt result revisions')
+        ordering = ['attempt', 'revision_number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['attempt', 'revision_number'],
+                name='uq_assessments_result_revision_number',
+            ),
+            models.UniqueConstraint(
+                fields=['attempt', 'supersedes'],
+                name='uq_assessments_result_revision_supersedes',
+            ),
+            models.CheckConstraint(
+                condition=Q(revision_number__gte=1),
+                name='chk_assessments_result_revision_number_gte_1',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(revision_number=1, supersedes__isnull=True)
+                    | Q(revision_number__gt=1, supersedes__isnull=False)
+                ),
+                name='chk_assessments_result_revision_chain_parity',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status='FINAL', final_score__isnull=False)
+                    | Q(status='PROVISIONAL', final_score__isnull=True)
+                ),
+                name='chk_assessments_result_revision_score_by_status',
+            ),
+            models.CheckConstraint(
+                condition=Q(final_score__isnull=True) | Q(final_score__gte=0, final_score__lte=100),
+                name='chk_assessments_result_revision_final_range',
+            ),
+            models.CheckConstraint(
+                condition=Q(provisional_score__isnull=True)
+                | Q(provisional_score__gte=0, provisional_score__lte=100),
+                name='chk_assessments_result_revision_provisional_range',
+            ),
+            models.CheckConstraint(
+                condition=Q(status='FINAL', provisional_score__isnull=True) | Q(status='PROVISIONAL'),
+                name='chk_assessments_result_revision_no_provisional_when_final',
+            ),
+            models.CheckConstraint(
+                condition=Q(status='FINAL') | Q(graded_weight=0) | Q(provisional_score__isnull=False),
+                name='chk_assessments_result_revision_provisional_required',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status='FINAL', evaluation_status='COMPLETE')
+                    | (Q(status='PROVISIONAL') & ~Q(evaluation_status='COMPLETE'))
+                ),
+                name='chk_assessments_result_revision_complete_iff_final',
+            ),
+            models.CheckConstraint(
+                condition=Q(total_weight__gt=0),
+                name='chk_assessments_result_revision_total_weight_gt_0',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(graded_weight__gte=0)
+                    & Q(excluded_weight__gte=0)
+                    & Q(graded_weight__lte=F('total_weight') - F('excluded_weight'))
+                ),
+                name='chk_assessments_result_revision_weight_bounds',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(earned_weight__gte=0)
+                    & Q(earned_weight__lte=F('graded_weight'))
+                ),
+                name='chk_assessments_result_revision_earned_bounds',
+            ),
+            models.CheckConstraint(
+                condition=Q(status='PROVISIONAL') | Q(graded_weight__gt=0),
+                name='chk_assessments_result_revision_final_requires_graded',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(question_count=F('correct_count') + F('incorrect_count')
+                      + F('partially_correct_count') + F('unanswered_count')
+                      + F('ungraded_count') + F('pending_manual_count'))
+                ),
+                name='chk_assessments_result_revision_outcome_counts_sum',
+            ),
+            models.CheckConstraint(
+                condition=Q(question_count=F('answered_count') + F('unanswered_count')),
+                name='chk_assessments_result_revision_answered_plus_unanswered',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(actor_type='SYSTEM', actor__isnull=True)
+                    | Q(actor_type='STAFF', actor__isnull=False)
+                ),
+                name='chk_assessments_result_revision_actor_coherence',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['attempt', 'revision_number']),
+            models.Index(fields=['supersedes']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"Revision #{self.revision_number} of {self.attempt_id} [{self.status}]"
+
+    def save(self, *args, **kwargs):
+        _reject_persisted_mutation(self, 'AttemptResultRevision')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("AttemptResultRevision records are immutable and cannot be deleted."))
+
+
+class AttemptResultHead(models.Model):
+    """Authoritative pointer to an attempt's current result revision (mutable pointer only)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt = models.OneToOneField(
+        AssessmentAttempt,
+        on_delete=models.PROTECT,
+        related_name='result_head',
+        verbose_name=_('attempt'),
+    )
+    current_revision = models.ForeignKey(
+        AttemptResultRevision,
+        on_delete=models.PROTECT,
+        related_name='+',
+        verbose_name=_('current revision'),
+    )
+    updated_at = models.DateTimeField(_('updated at'), auto_now=True)
+
+    class Meta:
+        db_table = 'assessments_attempt_result_head'
+        verbose_name = _('attempt result head')
+        verbose_name_plural = _('attempt result heads')
+
+    def __str__(self):
+        return f"ResultHead[{self.attempt_id}] -> rev {self.current_revision_id}"
+
+    def clean(self):
+        super().clean()
+        if self.current_revision_id and self.attempt_id:
+            rev = getattr(self, 'current_revision', None)
+            rev_attempt_id = rev.attempt_id if rev else None
+            if rev_attempt_id is None:
+                rev_attempt_id = (
+                    AttemptResultRevision.objects.filter(pk=self.current_revision_id)
+                    .values_list('attempt_id', flat=True)
+                    .first()
+                )
+            if rev_attempt_id != self.attempt_id:
+                raise ValidationError({
+                    'current_revision': _("Current revision must belong to the head's attempt.")
+                })
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+
+class AttemptQuestionEvaluation(models.Model):
+    """
+    Immutable per-question outcome belonging to one result revision.
+    Outcomes are children of the revision snapshot: superseding a result creates a
+    complete new outcome set rather than mutating individual rows.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    result_revision = models.ForeignKey(
+        AttemptResultRevision,
+        on_delete=models.PROTECT,
+        related_name='question_evaluations',
+        verbose_name=_('result revision'),
+    )
+    attempt_question = models.ForeignKey(
+        AttemptQuestion,
+        on_delete=models.PROTECT,
+        related_name='evaluations',
+        verbose_name=_('attempt question'),
+    )
+    outcome = models.CharField(_('outcome'), max_length=20, choices=OUTCOME_CHOICES)
+    disposition = models.CharField(_('disposition'), max_length=20, choices=DISPOSITION_CHOICES)
+    awarded_fraction = models.DecimalField(
+        _('awarded fraction'),
+        max_digits=5,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+    awarded_points = models.DecimalField(
+        _('awarded points'), max_digits=12, decimal_places=6, null=True, blank=True,
+    )
+    max_points = models.DecimalField(_('max points'), max_digits=12, decimal_places=6)
+    grading_strategy = models.CharField(_('grading strategy'), max_length=30, blank=True, default='')
+    evaluation_config_hash = models.CharField(
+        _('evaluation config hash'), max_length=64, blank=True, default='',
+    )
+    evaluator_version = models.CharField(_('evaluator version'), max_length=20, blank=True, default='')
+    ungraded_reason = models.CharField(_('ungraded reason'), max_length=30, blank=True, default='')
+    excluded_reason = models.CharField(_('excluded reason'), max_length=30, blank=True, default='')
+    answer_presence = models.CharField(
+        _('answer presence'), max_length=10, choices=ANSWER_PRESENCE_CHOICES, default='ABSENT',
+    )
+    absence_reason = models.CharField(
+        _('absence reason'), max_length=20, choices=ABSENCE_REASON_CHOICES, blank=True, default='',
+    )
+    answer_payload_hash = models.CharField(
+        _('answer payload hash'), max_length=64, blank=True, default='',
+    )
+    answer_canonicalization_version = models.CharField(
+        _('answer canonicalization version'), max_length=20, default='answer_canon_v1',
+    )
+    details = models.JSONField(_('details'), default=dict, blank=True)
+    created_at = models.DateTimeField(_('created at'), default=timezone.now)
+
+    objects = ImmutableResultQuerySet.as_manager()
+
+    class Meta:
+        db_table = 'assessments_attempt_question_evaluation'
+        verbose_name = _('attempt question evaluation')
+        verbose_name_plural = _('attempt question evaluations')
+        ordering = ['result_revision', 'attempt_question__order_index']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['result_revision', 'attempt_question'],
+                name='uq_assessments_question_eval_revision_question',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(outcome__in=['UNGRADED', 'PENDING_MANUAL'], disposition='UNDECIDED')
+                    | (~Q(outcome__in=['UNGRADED', 'PENDING_MANUAL']) & ~Q(disposition='UNDECIDED'))
+                ),
+                name='chk_assessments_question_eval_undecided_pairing',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(disposition='SCORED', awarded_fraction__isnull=False)
+                    | (Q(disposition__in=['EXCLUDED', 'UNDECIDED']) & Q(awarded_fraction__isnull=True))
+                ),
+                name='chk_assessments_question_eval_scored_fraction',
+            ),
+            models.CheckConstraint(
+                condition=Q(awarded_fraction__isnull=True)
+                | Q(awarded_fraction__gte=0, awarded_fraction__lte=1),
+                name='chk_assessments_question_eval_fraction_range',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(outcome='CORRECT', awarded_fraction=1)
+                    | Q(outcome='INCORRECT', awarded_fraction=0)
+                    | Q(outcome='PARTIALLY_CORRECT', awarded_fraction__gt=0, awarded_fraction__lt=1)
+                    | Q(outcome='UNANSWERED', awarded_fraction__isnull=True)
+                    | Q(outcome='UNANSWERED', awarded_fraction=0)
+                    | Q(outcome__in=['UNGRADED', 'PENDING_MANUAL'], awarded_fraction__isnull=True)
+                ),
+                name='chk_assessments_question_eval_outcome_fraction',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(disposition='EXCLUDED') & ~Q(excluded_reason='')
+                    | (~Q(disposition='EXCLUDED') & Q(excluded_reason=''))
+                ),
+                name='chk_assessments_question_eval_excluded_reason',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(outcome__in=['UNGRADED', 'PENDING_MANUAL']) & ~Q(ungraded_reason='')
+                    | (~Q(outcome__in=['UNGRADED', 'PENDING_MANUAL']) & Q(ungraded_reason=''))
+                ),
+                name='chk_assessments_question_eval_ungraded_reason',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(answer_presence='PRESENT', absence_reason='')
+                    | Q(answer_presence='ABSENT')
+                ),
+                name='chk_assessments_question_eval_presence_absence',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['attempt_question', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.outcome}/{self.disposition} for {self.attempt_question_id}"
+
+    def save(self, *args, **kwargs):
+        _reject_persisted_mutation(self, 'AttemptQuestionEvaluation')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("AttemptQuestionEvaluation records are immutable and cannot be deleted."))
+
+
+class ResultOutboxEvent(models.Model):
+    """
+    Transactional outbox row written atomically with a result revision.
+    Phase 2E.2 creates rows only; no dispatcher or worker is implemented here.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event_type = models.CharField(_('event type'), max_length=40)
+    attempt_id = models.UUIDField(_('attempt id'), db_index=True)
+    result_revision = models.ForeignKey(
+        AttemptResultRevision,
+        on_delete=models.PROTECT,
+        related_name='outbox_events',
+        verbose_name=_('result revision'),
+    )
+    dedupe_key = models.CharField(_('dedupe key'), max_length=128, unique=True)
+    payload = models.JSONField(_('payload'), default=dict, blank=True)
+    state = models.CharField(
+        _('state'), max_length=20, choices=OUTBOX_STATE_CHOICES, default='PENDING', db_index=True,
+    )
+    available_at = models.DateTimeField(_('available at'), default=timezone.now)
+    attempt_count = models.PositiveIntegerField(_('attempt count'), default=0)
+    last_error = models.CharField(_('last error'), max_length=500, blank=True, default='')
+    lease_owner = models.CharField(_('lease owner'), max_length=64, blank=True, default='')
+    lease_until = models.DateTimeField(_('lease until'), null=True, blank=True)
+    processed_at = models.DateTimeField(_('processed at'), null=True, blank=True)
+    dead_reason = models.CharField(_('dead reason'), max_length=60, blank=True, default='')
+    created_at = models.DateTimeField(_('created at'), auto_now_add=True)
+
+    class Meta:
+        db_table = 'assessments_result_outbox_event'
+        verbose_name = _('result outbox event')
+        verbose_name_plural = _('result outbox events')
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(state='CLAIMED', lease_owner__gt='', lease_until__isnull=False)
+                    | Q(state='PENDING', lease_owner='')
+                    | Q(state='PROCESSED', lease_owner='', processed_at__isnull=False)
+                    | Q(state='DEAD', lease_owner='')
+                ),
+                name='chk_assessments_outbox_state_fields',
+            ),
+            models.CheckConstraint(
+                condition=~Q(state='DEAD') | ~Q(dead_reason=''),
+                name='chk_assessments_outbox_dead_reason',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['state', 'available_at']),
+            models.Index(fields=['processed_at', 'available_at']),
+        ]
+
+    def __str__(self):
+        return f"Outbox[{self.event_type}] {self.state} rev={self.result_revision_id}"
+

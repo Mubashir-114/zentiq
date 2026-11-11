@@ -26,6 +26,8 @@ from apps.assessments.models import (
 )
 from .concurrency import with_deadlock_retry
 from .dto import AttemptSummaryDTO, sanitize_candidate_content_payload
+from .evaluation.service import AttemptEvaluationService
+from .terminal_snapshot_service import TerminalSnapshotService
 from .exceptions import (
     ActiveAttemptExistsError,
     AssessmentDeprecatedError,
@@ -380,6 +382,14 @@ class AssessmentAttemptService:
                     },
                 )
 
+                # Phase 2E.2 — freeze eligibility, then evaluate in this same
+                # transaction: a class-C/D failure rolls back submission too.
+                TerminalSnapshotService.record(attempt, decision_source='SUBMIT_API')
+                AttemptEvaluationService.evaluate_attempt(
+                    attempt,
+                    reason='INITIAL_EVALUATION',
+                )
+
         if is_expired:
             raise AttemptExpiredError("The time limit for this assessment attempt has expired.")
 
@@ -432,6 +442,9 @@ class AssessmentAttemptService:
                 'answer_count': attempt.answer_count,
             },
         )
+
+        # Phase 2E.2 — freeze terminal eligibility (D-02a: not evaluated).
+        TerminalSnapshotService.record(attempt, decision_source='DEADLINE_ENFORCEMENT')
         return build_attempt_summary(attempt)
 
     @classmethod
@@ -482,6 +495,9 @@ class AssessmentAttemptService:
                     'answer_count': attempt.answer_count,
                 },
             )
+
+            # Phase 2E.2 — freeze terminal eligibility (D-02a: not evaluated).
+            TerminalSnapshotService.record(attempt, decision_source='CANCEL_API')
 
             return build_attempt_summary(attempt)
 
