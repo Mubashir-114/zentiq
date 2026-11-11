@@ -11,6 +11,7 @@ urlpatterns = [
     # Versioned API routes
     path('api/v1/', include('apps.core.urls')),
     path('api/v1/', include('apps.accounts.urls')),
+    path('api/v1/', include('apps.assessments.urls')),
 
     # OpenAPI Schema & Documentation
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
