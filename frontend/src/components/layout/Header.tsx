@@ -1,10 +1,20 @@
 import { useState, useRef, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { cn } from '../../lib/utils';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { useAuth } from '../../features/auth/context/AuthContext';
 import { AvatarIcon } from '../../features/profile/components/AvatarPicker';
-import { Activity, ShieldCheck, Menu, User, LogOut, ChevronDown, LayoutDashboard } from 'lucide-react';
+import {
+  Activity,
+  ShieldCheck,
+  Menu,
+  User,
+  LogOut,
+  ChevronDown,
+  LayoutDashboard,
+  ClipboardList,
+} from 'lucide-react';
 
 interface HeaderProps {
   onToggleSidebar?: () => void;
@@ -14,6 +24,8 @@ interface HeaderProps {
 export function Header({ onToggleSidebar, isHealthy = null }: HeaderProps) {
   const { user, profile, isAuthenticated, logout } = useAuth();
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const isLanding = pathname === '/';
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -34,20 +46,38 @@ export function Header({ onToggleSidebar, isHealthy = null }: HeaderProps) {
     navigate('/');
   }
 
+  // Guest links get an animated volt underline; authenticated nav keeps its
+  // existing treatment so app surfaces are unaffected.
+  const navLinkClass = (isActive: boolean) =>
+    cn(
+      'text-sm font-medium text-[#9298AD] hover:text-[#F4F4F8] transition-colors',
+      !isAuthenticated &&
+        "relative rounded-sm after:absolute after:-bottom-2 after:left-0 after:h-px after:w-full after:origin-left after:scale-x-0 after:bg-volt after:transition-transform after:duration-[var(--duration-base)] after:ease-[var(--ease-out-expo)] after:content-[''] hover:after:scale-x-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-volt focus-visible:ring-offset-2 focus-visible:ring-offset-void",
+      !isAuthenticated && isActive && 'text-[#F4F4F8] after:scale-x-100'
+    );
+
   return (
-    <header className="sticky top-0 z-40 w-full border-b border-white/10 bg-[#10121E]/80 backdrop-blur-md">
+    <header
+      className={cn(
+        'sticky top-0 z-40 w-full border-b border-white/10 bg-[#10121E]/80 backdrop-blur-md',
+        isLanding && 'zq-header--landing'
+      )}
+    >
       <div className="flex h-16 items-center justify-between px-4 sm:px-6 lg:px-8">
         <div className="flex items-center gap-4">
           <button
             type="button"
             onClick={onToggleSidebar}
-            className="md:hidden p-2 rounded-lg text-[#9298AD] hover:text-[#F4F4F8] hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#8B5CF6]"
+            className="md:hidden p-2 rounded-lg text-[#9298AD] hover:text-[#F4F4F8] hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-volt"
             aria-label="Toggle navigation sidebar"
           >
             <Menu className="w-5 h-5" />
           </button>
 
-          <Link to="/" className="flex items-center gap-3 group">
+          <Link
+            to="/"
+            className="group flex items-center gap-3 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-volt focus-visible:ring-offset-2 focus-visible:ring-offset-void"
+          >
             <div className="w-9 h-9 rounded-lg bg-gradient-to-tr from-[#8B5CF6] to-[#22D3EE] p-[1.5px] transition-transform group-hover:scale-105">
               <div className="w-full h-full bg-[#10121E] rounded-[6.5px] flex items-center justify-center">
                 <span className="font-bold text-base tracking-wider bg-gradient-to-r from-[#8B5CF6] to-[#22D3EE] bg-clip-text text-transparent">
@@ -67,24 +97,27 @@ export function Header({ onToggleSidebar, isHealthy = null }: HeaderProps) {
         </div>
 
         <nav className="hidden md:flex items-center gap-6" aria-label="Desktop Navigation">
-          <Link
+          <NavLink
             to={isAuthenticated ? '/dashboard' : '/'}
-            className="text-sm font-medium text-[#9298AD] hover:text-[#F4F4F8] transition-colors"
+            end={!isAuthenticated}
+            className={({ isActive }) => navLinkClass(isActive)}
           >
             {isAuthenticated ? 'Dashboard' : 'Overview'}
-          </Link>
-          <Link
-            to="/architecture"
-            className="text-sm font-medium text-[#9298AD] hover:text-[#F4F4F8] transition-colors"
-          >
+          </NavLink>
+          {isAuthenticated && (
+            <Link
+              to="/assessments"
+              className="text-sm font-medium text-[#9298AD] hover:text-[#F4F4F8] transition-colors"
+            >
+              Assessments
+            </Link>
+          )}
+          <NavLink to="/architecture" className={({ isActive }) => navLinkClass(isActive)}>
             Architecture
-          </Link>
-          <Link
-            to="/health"
-            className="text-sm font-medium text-[#9298AD] hover:text-[#F4F4F8] transition-colors"
-          >
+          </NavLink>
+          <NavLink to="/health" className={({ isActive }) => navLinkClass(isActive)}>
             System Status
-          </Link>
+          </NavLink>
         </nav>
 
         <div className="flex items-center gap-3">
@@ -142,6 +175,15 @@ export function Header({ onToggleSidebar, isHealthy = null }: HeaderProps) {
                   >
                     <LayoutDashboard className="w-3.5 h-3.5 text-[#22D3EE]" />
                     <span>Player Dashboard</span>
+                  </Link>
+
+                  <Link
+                    to="/assessments"
+                    onClick={() => setUserMenuOpen(false)}
+                    className="flex items-center gap-2.5 px-3.5 py-2 text-xs text-[#F4F4F8] hover:bg-white/5 transition-colors"
+                  >
+                    <ClipboardList className="w-3.5 h-3.5 text-[#F5C451]" />
+                    <span>Assessment Catalogue</span>
                   </Link>
 
                   <Link
